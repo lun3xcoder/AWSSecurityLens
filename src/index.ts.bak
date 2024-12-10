@@ -1,0 +1,592 @@
+import { config } from 'dotenv';
+import { EC2Client, DescribeInstancesCommand, DescribeSecurityGroupsCommand } from "@aws-sdk/client-ec2";
+import { IAMClient, ListUsersCommand, GetAccountPasswordPolicyCommand } from "@aws-sdk/client-iam";
+import { S3Client, ListBucketsCommand, GetBucketPolicyCommand } from "@aws-sdk/client-s3";
+import { KMSClient, ListKeysCommand, GetKeyRotationStatusCommand } from "@aws-sdk/client-kms";
+import { RDSClient, DescribeDBInstancesCommand } from "@aws-sdk/client-rds";
+import { CloudTrailClient, DescribeTrailsCommand, GetTrailStatusCommand } from "@aws-sdk/client-cloudtrail";
+import { ConfigServiceClient, DescribeConfigurationRecordersCommand } from "@aws-sdk/client-config-service";
+import { GuardDutyClient, ListDetectorsCommand, GetDetectorCommand } from "@aws-sdk/client-guardduty";
+import { CloudWatchLogsClient, DescribeLogGroupsCommand } from "@aws-sdk/client-cloudwatch-logs";
+import logger from './utils/logger';
+import { SecurityFinding, EC2SecurityResults, IAMSecurityResults, S3SecurityResults, BucketPolicy, SecurityResults } from './types';
+import { SecurityFindingsExporter } from './utils/csvExporter';
+
+// Load environment variables
+config();
+
+export class AWSSecurityScanner {
+    private ec2Client: EC2Client;
+    private iamClient: IAMClient;
+    private s3Client: S3Client;
+    private kmsClient: KMSClient;
+    private rdsClient: RDSClient;
+    private cloudTrailClient: CloudTrailClient;
+    private configClient: ConfigServiceClient;
+    private guardDutyClient: GuardDutyClient;
+    private cloudWatchLogsClient: CloudWatchLogsClient;
+
+    constructor() {
+        const region = process.env.AWS_REGION || 'us-east-1';
+        
+        this.ec2Client = new EC2Client({ region });
+        this.iamClient = new IAMClient({ region });
+        this.s3Client = new S3Client({ region });
+        this.kmsClient = new KMSClient({ region });
+        this.rdsClient = new RDSClient({ region });
+        this.cloudTrailClient = new CloudTrailClient({ region });
+        this.configClient = new ConfigServiceClient({ region });
+        this.guardDutyClient = new GuardDutyClient({ region });
+        this.cloudWatchLogsClient = new CloudWatchLogsClient({ region });
+        
+        logger.info(`Initialized AWS Security Scanner in region: ${region}`);
+    }
+
+    async scanAll(): Promise<string> {
+        try {
+            logger.info('Starting comprehensive AWS security scan...');
+
+            const [
+                ec2Results,
+                iamResults,
+                s3Results,
+                kmsResults,
+                rdsResults,
+                cloudTrailResults,
+                configResults,
+                guardDutyResults,
+                cloudWatchResults
+            ] = await Promise.all([
+                this.scanEC2Security(),
+                this.scanIAMSecurity(),
+                this.scanS3Security(),
+                this.scanKMSSecurity(),
+                this.scanRDSSecurity(),
+                this.scanCloudTrailSecurity(),
+                this.scanConfigSecurity(),
+                this.scanGuardDutySecurity(),
+                this.scanCloudWatchSecurity()
+            ]);
+
+            // Export findings to CSV
+            const csvPath = await SecurityFindingsExporter.exportToCSV({
+                ec2Findings: ec2Results.findings,
+                iamFindings: iamResults.findings,
+                s3Findings: s3Results.findings,
+                kmsFindings: kmsResults.findings,
+                rdsFindings: rdsResults.findings,
+                cloudTrailFindings: cloudTrailResults.findings,
+                configFindings: configResults.findings,
+                guardDutyFindings: guardDutyResults.findings,
+                cloudWatchFindings: cloudWatchResults.findings
+            });
+
+            // Log findings summary
+            this.logFindingsSummary(
+                ec2Results.findings,
+                iamResults.findings,
+                s3Results.findings,
+                kmsResults.findings,
+                rdsResults.findings,
+                cloudTrailResults.findings,
+                configResults.findings,
+                guardDutyResults.findings,
+                cloudWatchResults.findings
+            );
+
+            return csvPath;
+        } catch (error) {
+            logger.error('Error during security scan:', error);
+            throw error;
+        }
+    }
+
+    async scanEC2Security(): Promise<EC2SecurityResults> {
+        try {
+            logger.info('Starting EC2 security scan...');
+            
+            const instances = await this.ec2Client.send(new DescribeInstancesCommand({}));
+            const securityGroups = await this.ec2Client.send(new DescribeSecurityGroupsCommand({}));
+
+            const results: EC2SecurityResults = {
+                instances: instances.Reservations?.map(r => r.Instances).flat() || [],
+                securityGroups: securityGroups.SecurityGroups || [],
+                findings: this.analyzeEC2Security(instances, securityGroups)
+            };
+
+            logger.info('EC2 security scan completed');
+            return results;
+        } catch (error) {
+            logger.error('Error scanning EC2:', error);
+            throw error;
+        }
+    }
+
+    async scanIAMSecurity(): Promise<IAMSecurityResults> {
+        try {
+            logger.info('Starting IAM security scan...');
+            
+            const users = await this.iamClient.send(new ListUsersCommand({}));
+            const passwordPolicy = await this.iamClient.send(new GetAccountPasswordPolicyCommand({}));
+
+            const results: IAMSecurityResults = {
+                users: users.Users || [],
+                passwordPolicy: passwordPolicy.PasswordPolicy,
+                findings: this.analyzeIAMSecurity(users, passwordPolicy)
+            };
+
+            logger.info('IAM security scan completed');
+            return results;
+        } catch (error) {
+            logger.error('Error scanning IAM:', error);
+            throw error;
+        }
+    }
+
+    async scanS3Security(): Promise<S3SecurityResults> {
+        try {
+            logger.info('Starting S3 security scan...');
+            
+            const buckets = await this.s3Client.send(new ListBucketsCommand({}));
+            
+            const bucketPolicies: BucketPolicy[] = await Promise.all(
+                (buckets.Buckets || []).map(async bucket => {
+                    try {
+                        const policy = await this.s3Client.send(
+                            new GetBucketPolicyCommand({ Bucket: bucket.Name! })
+                        );
+                        return { bucket: bucket.Name!, policy: policy.Policy || null };
+                    } catch (error) {
+                        logger.warn(`Unable to get policy for bucket ${bucket.Name}:`, error);
+                        return { bucket: bucket.Name!, policy: null };
+                    }
+                })
+            );
+
+            const results: S3SecurityResults = {
+                buckets: buckets.Buckets || [],
+                bucketPolicies,
+                findings: this.analyzeS3Security(buckets, bucketPolicies)
+            };
+
+            logger.info('S3 security scan completed');
+            return results;
+        } catch (error) {
+            logger.error('Error scanning S3:', error);
+            throw error;
+        }
+    }
+
+    async scanKMSSecurity(): Promise<SecurityResults> {
+        try {
+            logger.info('Starting KMS security scan...');
+            
+            const keys = await this.kmsClient.send(new ListKeysCommand({}));
+            const keyRotationStatuses = await Promise.all(
+                (keys.Keys || []).map(async key => {
+                    try {
+                        return await this.kmsClient.send(
+                            new GetKeyRotationStatusCommand({ KeyId: key.KeyId! })
+                        );
+                    } catch (error) {
+                        logger.warn(`Unable to get rotation status for key ${key.KeyId}:`, error);
+                        return null;
+                    }
+                })
+            );
+
+            const findings = this.analyzeKMSSecurity(keys, keyRotationStatuses);
+            logger.info('KMS security scan completed');
+            return { findings };
+        } catch (error) {
+            logger.error('Error scanning KMS:', error);
+            throw error;
+        }
+    }
+
+    async scanRDSSecurity(): Promise<SecurityResults> {
+        try {
+            logger.info('Starting RDS security scan...');
+            
+            const instances = await this.rdsClient.send(new DescribeDBInstancesCommand({}));
+            const findings = this.analyzeRDSSecurity(instances);
+            
+            logger.info('RDS security scan completed');
+            return { findings };
+        } catch (error) {
+            logger.error('Error scanning RDS:', error);
+            throw error;
+        }
+    }
+
+    async scanCloudTrailSecurity(): Promise<SecurityResults> {
+        try {
+            logger.info('Starting CloudTrail security scan...');
+            
+            const trails = await this.cloudTrailClient.send(new DescribeTrailsCommand({}));
+            const trailStatuses = await Promise.all(
+                (trails.trailList || []).map(async trail => {
+                    try {
+                        return await this.cloudTrailClient.send(
+                            new GetTrailStatusCommand({ Name: trail.Name! })
+                        );
+                    } catch (error) {
+                        logger.warn(`Unable to get status for trail ${trail.Name}:`, error);
+                        return null;
+                    }
+                })
+            );
+
+            const findings = this.analyzeCloudTrailSecurity(trails, trailStatuses);
+            logger.info('CloudTrail security scan completed');
+            return { findings };
+        } catch (error) {
+            logger.error('Error scanning CloudTrail:', error);
+            throw error;
+        }
+    }
+
+    async scanConfigSecurity(): Promise<SecurityResults> {
+        try {
+            logger.info('Starting AWS Config security scan...');
+            
+            const configRecorders = await this.configClient.send(
+                new DescribeConfigurationRecordersCommand({})
+            );
+            const findings = this.analyzeConfigSecurity(configRecorders);
+            
+            logger.info('AWS Config security scan completed');
+            return { findings };
+        } catch (error) {
+            logger.error('Error scanning AWS Config:', error);
+            throw error;
+        }
+    }
+
+    async scanGuardDutySecurity(): Promise<SecurityResults> {
+        try {
+            logger.info('Starting GuardDuty security scan...');
+            
+            const detectors = await this.guardDutyClient.send(new ListDetectorsCommand({}));
+            const detectorDetails = await Promise.all(
+                (detectors.DetectorIds || []).map(async id => {
+                    try {
+                        return await this.guardDutyClient.send(
+                            new GetDetectorCommand({ DetectorId: id })
+                        );
+                    } catch (error) {
+                        logger.warn(`Unable to get details for detector ${id}:`, error);
+                        return null;
+                    }
+                })
+            );
+
+            const findings = this.analyzeGuardDutySecurity(detectors, detectorDetails);
+            logger.info('GuardDuty security scan completed');
+            return { findings };
+        } catch (error) {
+            logger.error('Error scanning GuardDuty:', error);
+            throw error;
+        }
+    }
+
+    async scanCloudWatchSecurity(): Promise<SecurityResults> {
+        try {
+            logger.info('Starting CloudWatch security scan...');
+            
+            const logGroups = await this.cloudWatchLogsClient.send(
+                new DescribeLogGroupsCommand({})
+            );
+            const findings = this.analyzeCloudWatchSecurity(logGroups);
+            
+            logger.info('CloudWatch security scan completed');
+            return { findings };
+        } catch (error) {
+            logger.error('Error scanning CloudWatch:', error);
+            throw error;
+        }
+    }
+
+    private analyzeEC2Security(instances: any, securityGroups: any): SecurityFinding[] {
+        const findings: SecurityFinding[] = [];
+
+        // Check for instances without tags
+        const instancesWithoutTags = instances.Reservations?.flatMap((r: any) => 
+            r.Instances?.filter((i: any) => !i.Tags || i.Tags.length === 0)
+        );
+
+        if (instancesWithoutTags?.length > 0) {
+            findings.push({
+                severity: 'MEDIUM',
+                description: 'Instances found without tags',
+                affected: instancesWithoutTags
+            });
+        }
+
+        // Check for security groups with open ports
+        const openSecurityGroups = securityGroups.SecurityGroups?.filter((sg: any) =>
+            sg.IpPermissions?.some((perm: any) =>
+                perm.IpRanges?.some((range: any) => range.CidrIp === '0.0.0.0/0')
+            )
+        );
+
+        if (openSecurityGroups?.length > 0) {
+            findings.push({
+                severity: 'HIGH',
+                description: 'Security groups with open ports (0.0.0.0/0)',
+                affected: openSecurityGroups
+            });
+        }
+
+        return findings;
+    }
+
+    private analyzeIAMSecurity(users: any, passwordPolicy: any): SecurityFinding[] {
+        const findings: SecurityFinding[] = [];
+
+        // Check for users without MFA
+        const usersWithoutMFA = users.Users?.filter((user: any) => !user.MFADevices?.length);
+        if (usersWithoutMFA?.length > 0) {
+            findings.push({
+                severity: 'HIGH',
+                description: 'Users without MFA enabled',
+                affected: usersWithoutMFA
+            });
+        }
+
+        // Check password policy
+        if (!passwordPolicy.PasswordPolicy?.MinimumPasswordLength || 
+            passwordPolicy.PasswordPolicy.MinimumPasswordLength < 14) {
+            findings.push({
+                severity: 'MEDIUM',
+                description: 'Weak password policy configuration',
+                details: 'Password minimum length should be at least 14 characters'
+            });
+        }
+
+        return findings;
+    }
+
+    private analyzeS3Security(buckets: any, bucketPolicies: BucketPolicy[]): SecurityFinding[] {
+        const findings: SecurityFinding[] = [];
+
+        // Check for public buckets
+        bucketPolicies.forEach((bp) => {
+            if (bp.policy && bp.policy.includes('"Principal": "*"')) {
+                findings.push({
+                    severity: 'HIGH',
+                    description: 'Potentially public S3 bucket',
+                    affected: bp.bucket
+                });
+            }
+        });
+
+        return findings;
+    }
+
+    private analyzeKMSSecurity(keys: any, rotationStatuses: any[]): SecurityFinding[] {
+        const findings: SecurityFinding[] = [];
+
+        // Check for keys without rotation enabled
+        const nonRotatingKeys = keys.Keys?.filter((key: any, index: number) => 
+            !rotationStatuses[index]?.KeyRotationEnabled
+        );
+
+        if (nonRotatingKeys?.length > 0) {
+            findings.push({
+                severity: 'HIGH',
+                description: 'KMS keys found without automatic rotation enabled',
+                affected: nonRotatingKeys
+            });
+        }
+
+        return findings;
+    }
+
+    private analyzeRDSSecurity(instances: any): SecurityFinding[] {
+        const findings: SecurityFinding[] = [];
+
+        // Check for unencrypted instances
+        const unencryptedInstances = instances.DBInstances?.filter(
+            (instance: any) => !instance.StorageEncrypted
+        );
+
+        if (unencryptedInstances?.length > 0) {
+            findings.push({
+                severity: 'HIGH',
+                description: 'RDS instances found without encryption at rest',
+                affected: unencryptedInstances
+            });
+        }
+
+        // Check for publicly accessible instances
+        const publicInstances = instances.DBInstances?.filter(
+            (instance: any) => instance.PubliclyAccessible
+        );
+
+        if (publicInstances?.length > 0) {
+            findings.push({
+                severity: 'HIGH',
+                description: 'RDS instances found with public accessibility',
+                affected: publicInstances
+            });
+        }
+
+        return findings;
+    }
+
+    private analyzeCloudTrailSecurity(trails: any, trailStatuses: any[]): SecurityFinding[] {
+        const findings: SecurityFinding[] = [];
+
+        // Check for trails without log file validation
+        const unvalidatedTrails = trails.trailList?.filter(
+            (trail: any) => !trail.LogFileValidationEnabled
+        );
+
+        if (unvalidatedTrails?.length > 0) {
+            findings.push({
+                severity: 'MEDIUM',
+                description: 'CloudTrail trails found without log file validation',
+                affected: unvalidatedTrails
+            });
+        }
+
+        // Check for inactive trails
+        const inactiveTrails = trails.trailList?.filter(
+            (trail: any, index: number) => !trailStatuses[index]?.IsLogging
+        );
+
+        if (inactiveTrails?.length > 0) {
+            findings.push({
+                severity: 'HIGH',
+                description: 'Inactive CloudTrail trails found',
+                affected: inactiveTrails
+            });
+        }
+
+        return findings;
+    }
+
+    private analyzeConfigSecurity(configRecorders: any): SecurityFinding[] {
+        const findings: SecurityFinding[] = [];
+
+        // Check if AWS Config is enabled
+        if (!configRecorders.ConfigurationRecorders?.length) {
+            findings.push({
+                severity: 'HIGH',
+                description: 'AWS Config is not enabled in this region',
+                affected: 'All resources'
+            });
+        }
+
+        return findings;
+    }
+
+    private analyzeGuardDutySecurity(detectors: any, detectorDetails: any[]): SecurityFinding[] {
+        const findings: SecurityFinding[] = [];
+
+        // Check if GuardDuty is enabled
+        if (!detectors.DetectorIds?.length) {
+            findings.push({
+                severity: 'HIGH',
+                description: 'GuardDuty is not enabled in this region',
+                affected: 'All resources'
+            });
+        }
+
+        // Check for disabled detectors
+        const disabledDetectors = detectorDetails.filter(
+            detector => detector?.Status === 'DISABLED'
+        );
+
+        if (disabledDetectors.length > 0) {
+            findings.push({
+                severity: 'HIGH',
+                description: 'GuardDuty detectors found in disabled state',
+                affected: disabledDetectors
+            });
+        }
+
+        return findings;
+    }
+
+    private analyzeCloudWatchSecurity(logGroups: any): SecurityFinding[] {
+        const findings: SecurityFinding[] = [];
+
+        // Check for log groups without retention policies
+        const noRetentionGroups = logGroups.logGroups?.filter(
+            (group: any) => !group.retentionInDays
+        );
+
+        if (noRetentionGroups?.length > 0) {
+            findings.push({
+                severity: 'MEDIUM',
+                description: 'CloudWatch Log groups found without retention policies',
+                affected: noRetentionGroups
+            });
+        }
+
+        return findings;
+    }
+
+    private logFindingsSummary(
+        ec2Findings: SecurityFinding[],
+        iamFindings: SecurityFinding[],
+        s3Findings: SecurityFinding[],
+        kmsFindings: SecurityFinding[],
+        rdsFindings: SecurityFinding[],
+        cloudTrailFindings: SecurityFinding[],
+        configFindings: SecurityFinding[],
+        guardDutyFindings: SecurityFinding[],
+        cloudWatchFindings: SecurityFinding[]
+    ) {
+        const allFindings = [
+            ...ec2Findings,
+            ...iamFindings,
+            ...s3Findings,
+            ...kmsFindings,
+            ...rdsFindings,
+            ...cloudTrailFindings,
+            ...configFindings,
+            ...guardDutyFindings,
+            ...cloudWatchFindings
+        ];
+
+        const totalFindings = allFindings.length;
+        const highSeverity = allFindings.filter(f => f.severity === 'HIGH').length;
+        const mediumSeverity = allFindings.filter(f => f.severity === 'MEDIUM').length;
+
+        logger.info('Security Scan Summary:', {
+            totalFindings,
+            highSeverityFindings: highSeverity,
+            mediumSeverityFindings: mediumSeverity,
+            findingsByService: {
+                EC2: ec2Findings.length,
+                IAM: iamFindings.length,
+                S3: s3Findings.length,
+                KMS: kmsFindings.length,
+                RDS: rdsFindings.length,
+                CloudTrail: cloudTrailFindings.length,
+                Config: configFindings.length,
+                GuardDuty: guardDutyFindings.length,
+                CloudWatch: cloudWatchFindings.length
+            }
+        });
+    }
+}
+
+async function main() {
+    const scanner = new AWSSecurityScanner();
+    
+    try {
+        const csvPath = await scanner.scanAll();
+        logger.info(`Security scan completed. Results exported to: ${csvPath}`);
+    } catch (error) {
+        logger.error('Error during security scan:', error);
+        process.exit(1);
+    }
+}
+
+if (require.main === module) {
+    main();
+}
