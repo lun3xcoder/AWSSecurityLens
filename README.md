@@ -29,7 +29,7 @@ A comprehensive security scanning solution for AWS accounts that integrates with
 
 1. Clone the repository:
    ```bash
-   git clone [your-repo-url]
+   git clone https://github.com/lun3xcoder/AWSSecurityLens.git
    cd aws-security-lens
    ```
 
